@@ -14,6 +14,10 @@ This tool iterates through your library pages, downloads each song, and can opti
 - **Proxy Support:** Allows routing traffic through an HTTP/S proxy.
 - **User-Friendly Output:** Uses colored console output for clear and readable progress updates.
 
+
+https://imgur.com/a/Ox9goh7
+
+
 ## Requirements
 
 - [Python 3.6+](https://www.python.org/downloads/)
@@ -50,6 +54,8 @@ The script requires a **Suno Authorization Token** to access your private librar
 9.  Find the `Authorization` header. The value will look like `Bearer [long_string_of_characters]`.
 10. **Copy only the long string of characters** (the token itself), *without* the word `Bearer `.
 
+Example (Copy the whole string)
+https://i.imgur.com/PQtOIM5.jpeg
 
 
 **Important:** Your token is like a password. **Do not share it with anyone.**
