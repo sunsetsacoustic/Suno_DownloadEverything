@@ -209,8 +209,6 @@ def download_all_pages_parallel(last_page, token_string, proxies_list=None, toke
                     # Prompt for new token (synchronized to avoid multiple prompts)
                     with pages_lock:
                         if token_container:
-                            # Get current token value
-                            old_token = token_container[0]
                             new_token = prompt_for_new_token()
                             if new_token:
                                 token_container[0] = new_token
