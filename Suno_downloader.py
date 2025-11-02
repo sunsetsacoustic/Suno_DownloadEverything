@@ -109,39 +109,65 @@ def embed_metadata(mp3_path, image_url=None, title=None, artist=None, proxies_li
     audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=image_bytes))
     audio.save(v2_version=3)
 
-def find_last_page(token_string, proxies_list=None):
-    """Find the last page number (which contains the oldest songs)."""
-    log_with_timestamp("Finding total number of pages...", Fore.CYAN)
+def check_page_exists(page_num, token_string, proxies_list=None):
+    """Quickly check if a page has content (returns True if page has clips)."""
     base_api_url = "https://studio-api.prod.suno.com/api/feed/v2?hide_disliked=true&hide_gen_stems=true&hide_studio_clips=true&page="
     headers = {"Authorization": f"Bearer {token_string}"}
+    api_url = f"{base_api_url}{page_num}"
     
-    page = 1
-    last_page_with_content = 1
+    try:
+        response = requests.get(api_url, headers=headers, proxies=pick_proxy_dict(proxies_list), timeout=10)
+        if response.status_code in [401, 403]:
+            return None  # Auth error
+        if response.status_code == 404 or response.status_code >= 500:
+            return False  # No content or error
+        response.raise_for_status()
+        data = response.json()
+        clips = data if isinstance(data, list) else data.get("clips", [])
+        return len(clips) > 0
+    except requests.exceptions.RequestException:
+        return False
+
+def find_last_page(token_string, proxies_list=None):
+    """Find the last page number using binary search (which contains the oldest songs)."""
+    log_with_timestamp("🔍 Finding last page using binary search...", Fore.CYAN)
     
-    while True:
-        api_url = f"{base_api_url}{page}"
-        try:
-            response = requests.get(api_url, headers=headers, proxies=pick_proxy_dict(proxies_list), timeout=15)
-            if response.status_code in [401, 403]:
-                log_with_timestamp(f"Authorization failed (status {response.status_code}). Token may be expired.", Fore.RED)
-                return 0
-            response.raise_for_status()
-            data = response.json()
-            
-            clips = data if isinstance(data, list) else data.get("clips", [])
-            if not clips:
-                break
-            
-            last_page_with_content = page
-            page += 1
-            time.sleep(0.5)  # Quick scan
-            
-        except requests.exceptions.RequestException as e:
-            log_with_timestamp(f"Request failed on page {page}: {e}", Fore.RED)
-            return last_page_with_content
+    # First check if page 1 exists
+    exists = check_page_exists(1, token_string, proxies_list)
+    if exists is None:
+        log_with_timestamp("Authorization failed. Token may be expired.", Fore.RED)
+        return 0
+    if not exists:
+        log_with_timestamp("No songs found on page 1", Fore.RED)
+        return 0
     
-    log_with_timestamp(f"Found {last_page_with_content} page(s) of songs", Fore.GREEN)
-    return last_page_with_content
+    # Binary search to find the last page
+    # First, find an upper bound by exponentially increasing
+    low = 1
+    high = 2
+    
+    log_with_timestamp(f"🔎 Searching for upper bound... checking page {high}", Fore.CYAN)
+    while check_page_exists(high, token_string, proxies_list):
+        low = high
+        high *= 2
+        log_with_timestamp(f"🔎 Page {low} exists, trying page {high}...", Fore.CYAN)
+        time.sleep(0.1)  # Small delay to avoid rate limiting
+    
+    log_with_timestamp(f"🔎 Upper bound found between page {low} and {high}, binary searching...", Fore.CYAN)
+    
+    # Now binary search between low and high
+    while low < high:
+        mid = (low + high + 1) // 2
+        log_with_timestamp(f"🔎 Checking page {mid} (range: {low}-{high})...", Fore.CYAN)
+        
+        if check_page_exists(mid, token_string, proxies_list):
+            low = mid
+        else:
+            high = mid - 1
+        time.sleep(0.1)  # Small delay to avoid rate limiting
+    
+    log_with_timestamp(f"✅ Found last page: {low}", Fore.GREEN)
+    return low
 
 def extract_private_song_info(token_string, proxies_list=None, song_queue=None):
     """
@@ -410,21 +436,23 @@ def main():
                             failed_count += 1
                         futures.remove(future)
                 
-                # Progress update every 30 seconds
+                # Progress update every 30 seconds (only if we've started processing)
                 if time.time() - last_progress_time > 30:
                     total = downloaded_count + failed_count + skipped_count
-                    if total_songs[0] > 0:
-                        progress = (total / total_songs[0]) * 100
-                        log_with_timestamp(
-                            f"📊 Progress: {total}/{total_songs[0]} ({progress:.1f}%) | "
-                            f"✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
-                            Fore.CYAN
-                        )
-                    else:
-                        log_with_timestamp(
-                            f"📊 Processed: {total} | ✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
-                            Fore.CYAN
-                        )
+                    # Only show progress if we've actually processed something or extraction is complete
+                    if total > 0 or extraction_complete.is_set():
+                        if total_songs[0] > 0:
+                            progress = (total / total_songs[0]) * 100
+                            log_with_timestamp(
+                                f"📊 Progress: {total}/{total_songs[0]} ({progress:.1f}%) | "
+                                f"✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
+                                Fore.CYAN
+                            )
+                        else:
+                            log_with_timestamp(
+                                f"📊 Processed: {total} | ✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
+                                Fore.CYAN
+                            )
                     last_progress_time = time.time()
                 
                 time.sleep(0.1)
