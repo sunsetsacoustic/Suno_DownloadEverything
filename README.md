@@ -8,6 +8,12 @@ This tool iterates through your library pages, downloads each song, and can opti
 ## Features
 
 - **Bulk Download:** Downloads all songs from your private library.
+- **Automatic Retry:** Failed downloads are automatically retried up to 3 times with exponential backoff.
+- **Chronological Order:** Songs are downloaded from oldest to newest for consistent version numbering.
+- **Parallel Downloads:** Download multiple songs simultaneously with configurable worker threads.
+- **Resume Support:** Skip already downloaded songs and only fetch new ones (like rsync).
+- **Persistent State:** Tracks downloaded songs in a JSON file to enable resume functionality.
+- **Failure Placeholders:** Creates placeholder files when downloads fail after all retries.
 - **Metadata Embedding:** Automatically embeds the title, artist, and cover art (thumbnail) into the MP3 file.
 - **File Sanitization:** Cleans up song titles to create valid filenames for any operating system.
 - **Duplicate Handling:** If a file with the same name already exists, it saves the new file with a version suffix (e.g., `My Song v2.mp3`) to avoid overwriting.
@@ -76,12 +82,43 @@ python suno_downloader.py --token "your_token_here" --directory "My Suno Music" 
 ```
 This will download all songs and their thumbnails into a folder named `My Suno Music`.
 
+**Parallel Downloads (faster for large libraries):**
+```bash
+python suno_downloader.py --token "your_token_here" --max-workers 5 --with-thumbnail
+```
+This will download 5 songs simultaneously, significantly speeding up the process.
+
+**Resume Downloads (skip already downloaded songs):**
+```bash
+python suno_downloader.py --token "your_token_here" --resume
+```
+This will skip songs that have already been downloaded, allowing you to run the script multiple times to only fetch new songs.
+
 ### Command-Line Arguments
 
 - `--token` **(Required)**: Your Suno authorization token.
 - `--directory` (Optional): The local directory where files will be saved. Defaults to `suno-downloads`.
 - `--with-thumbnail` (Optional): A flag to download and embed the song's cover art.
+- `--max-workers` (Optional): Number of parallel downloads (default: 1). Higher values download faster but use more bandwidth.
+- `--resume` (Optional): Skip songs that have already been downloaded based on the state file.
 - `--proxy` (Optional): A proxy server URL (e.g., `http://user:pass@127.0.0.1:8080`). You can provide multiple proxies separated by commas.
+
+### New Features Explained
+
+#### Automatic Retry
+If a download fails due to network issues (like timeouts), the script will automatically retry up to 3 times with increasing delays between attempts. This ensures that temporary network issues don't cause missing files.
+
+#### Chronological Order
+Songs are now downloaded from oldest to newest. This means your first song will be named without a version number, and newer songs with the same name will get version numbers (v2, v3, etc.). This is more intuitive than the previous behavior.
+
+#### Parallel Downloads
+Use `--max-workers` to download multiple songs at the same time. For example, `--max-workers 5` will download 5 songs simultaneously. This is especially useful for large libraries (like 9000+ songs).
+
+#### Resume Support
+The script now maintains a state file (`suno_download_state.json`) that tracks which songs have been successfully downloaded. Use `--resume` to skip already downloaded songs and only fetch new ones. This is perfect for regularly updating your library without re-downloading everything.
+
+#### Failure Placeholders
+If a download fails after all retry attempts, the script creates a placeholder text file (e.g., `Song Name_FAILED.txt`) that contains the error message. This ensures you can identify which downloads failed and why.
 
 ## Disclaimer
 
