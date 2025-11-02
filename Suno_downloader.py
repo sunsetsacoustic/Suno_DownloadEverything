@@ -55,7 +55,7 @@ def sanitize_filename(name, maxlen=200):
     safe = safe.strip(" .")
     return safe[:maxlen] if len(safe) > maxlen else safe
 
-def retry_with_backoff(max_retries=3, initial_delay=1, backoff_factor=2):
+def retry_with_backoff(max_retries=10, initial_delay=1, backoff_factor=2):
     """Decorator to retry a function with exponential backoff."""
     def decorator(func):
         @wraps(func)
@@ -105,7 +105,7 @@ def pick_proxy_dict(proxies_list):
     proxy = random.choice(proxies_list)
     return {"http": proxy, "https": proxy}
 
-@retry_with_backoff(max_retries=3, initial_delay=2, backoff_factor=2)
+@retry_with_backoff(max_retries=10, initial_delay=2, backoff_factor=2)
 def embed_metadata(mp3_path, image_url=None, title=None, artist=None, proxies_list=None, token=None, timeout=15):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     proxy_dict = pick_proxy_dict(proxies_list)
@@ -145,6 +145,141 @@ def check_page_exists(page_num, token_string, proxies_list=None):
         return len(clips) > 0
     except requests.exceptions.RequestException:
         return False
+
+def fetch_page_with_retry(page_num, token_container, proxies_list=None, max_retries=10):
+    """Fetch a single page with retry logic. Returns the page data or raises exception."""
+    base_api_url = "https://studio-api.prod.suno.com/api/feed/v2?hide_disliked=true&hide_gen_stems=true&hide_studio_clips=true&page="
+    api_url = f"{base_api_url}{page_num}"
+    
+    delay = 2
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Get current token from container
+            current_token = token_container[0] if isinstance(token_container, list) else token_container
+            headers = {"Authorization": f"Bearer {current_token}"}
+            
+            response = requests.get(api_url, headers=headers, proxies=pick_proxy_dict(proxies_list), timeout=15)
+            
+            if response.status_code in [401, 403]:
+                raise Exception(f"Authorization failed (status {response.status_code})")
+            
+            response.raise_for_status()
+            data = response.json()
+            clips = data if isinstance(data, list) else data.get("clips", [])
+            
+            return clips
+            
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                log_with_timestamp(f"    -> Page {page_num} attempt {attempt + 1} failed: {e}", Fore.YELLOW)
+                log_with_timestamp(f"    -> Retrying in {delay} seconds...", Fore.YELLOW)
+                time.sleep(delay)
+                delay *= 2
+            else:
+                log_with_timestamp(f"    -> Page {page_num} failed after {max_retries} attempts", Fore.RED)
+    
+    raise last_exception
+
+def download_all_pages_parallel(last_page, token_string, proxies_list=None, token_container=None, max_workers=5):
+    """
+    Download all pages in parallel before processing songs.
+    Returns a list of all song data in chronological order (oldest first).
+    Stores pages in state as they're downloaded to track progress.
+    """
+    log_with_timestamp(f"📥 Pre-downloading all {last_page} pages in parallel...", Fore.CYAN)
+    
+    pages_data = {}  # {page_num: [song_data_list]}
+    pages_lock = Lock()
+    
+    def fetch_single_page(page_num):
+        """Fetch a single page with retry and token update support."""
+        try:
+            log_with_timestamp(f"  📄 Fetching page {page_num}/{last_page}...", Fore.MAGENTA)
+            
+            # Try to fetch with current token, handle auth errors specially
+            try:
+                clips = fetch_page_with_retry(page_num, token_container or [token_string], proxies_list, max_retries=10)
+            except Exception as e:
+                if "Authorization failed" in str(e):
+                    log_with_timestamp(f"  ⚠️  Page {page_num} failed: Authorization error", Fore.RED)
+                    
+                    # Prompt for new token (synchronized to avoid multiple prompts)
+                    with pages_lock:
+                        if token_container:
+                            # Get current token value
+                            old_token = token_container[0]
+                            new_token = prompt_for_new_token()
+                            if new_token:
+                                token_container[0] = new_token
+                                log_with_timestamp(f"  🔄 Retrying page {page_num} with new token...", Fore.CYAN)
+                                # Retry with new token
+                                clips = fetch_page_with_retry(page_num, token_container, proxies_list, max_retries=10)
+                            else:
+                                raise Exception("No new token provided")
+                        else:
+                            raise Exception("Cannot update token - no token container")
+                else:
+                    raise
+            
+            log_with_timestamp(f"  ✅ Page {page_num}/{last_page} downloaded ({len(clips)} clips)", Fore.GREEN)
+            
+            # Process clips into song data
+            page_songs = []
+            for clip in clips:
+                uuid = clip.get("id")
+                title = clip.get("title")
+                audio_url = clip.get("audio_url")
+                image_url = clip.get("image_url")
+                created_at = clip.get("created_at", "")
+                
+                if uuid and title and audio_url:
+                    song_data = {
+                        "uuid": uuid,
+                        "title": title,
+                        "audio_url": audio_url,
+                        "image_url": image_url,
+                        "display_name": clip.get("display_name"),
+                        "created_at": created_at
+                    }
+                    page_songs.append(song_data)
+            
+            # Reverse songs within page (API returns newest first within each page)
+            page_songs.reverse()
+            
+            with pages_lock:
+                pages_data[page_num] = page_songs
+            
+            return True
+            
+        except Exception as e:
+            log_with_timestamp(f"  ❌ Page {page_num} failed after all retries: {e}", Fore.RED)
+            raise
+    
+    # Download all pages in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all pages in reverse order (last to first)
+        futures = {executor.submit(fetch_single_page, page): page for page in range(last_page, 0, -1)}
+        
+        # Wait for all to complete
+        for future in as_completed(futures):
+            page_num = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                log_with_timestamp(f"❌ Failed to download page {page_num}: {e}", Fore.RED)
+                raise Exception(f"Page download failed for page {page_num}. Cannot continue.")
+    
+    # Combine all pages in order (from last to first)
+    all_songs = []
+    for page_num in range(last_page, 0, -1):
+        if page_num in pages_data:
+            all_songs.extend(pages_data[page_num])
+    
+    log_with_timestamp(f"✅ All {last_page} pages downloaded successfully! Total songs: {len(all_songs)}", Fore.GREEN)
+    return all_songs
 
 def find_last_page(token_string, proxies_list=None):
     """Find the last page number using binary search (which contains the oldest songs)."""
@@ -189,105 +324,31 @@ def find_last_page(token_string, proxies_list=None):
 
 def extract_private_song_info(token_string, proxies_list=None, song_queue=None, token_container=None):
     """
-    Extract private song info and optionally add songs to a queue for immediate processing.
-    Returns songs in chronological order (oldest first) by fetching pages in reverse.
+    Extract private song info with parallel page downloading.
+    Returns songs in chronological order (oldest first).
     token_container: optional list containing [token] that can be updated when token expires
     """
     log_with_timestamp("Extracting private songs using Authorization Token...", Fore.CYAN)
-    base_api_url = "https://studio-api.prod.suno.com/api/feed/v2?hide_disliked=true&hide_gen_stems=true&hide_studio_clips=true&page="
     
     # Use token from container if provided, otherwise use token_string
     current_token = token_container[0] if token_container else token_string
-    headers = {"Authorization": f"Bearer {current_token}"}
 
     # Find the last page first
     last_page = find_last_page(current_token, proxies_list)
     if last_page == 0:
         return []
     
-    all_songs = []
+    # Download all pages in parallel with retry logic
+    try:
+        all_songs = download_all_pages_parallel(last_page, current_token, proxies_list, token_container, max_workers=5)
+    except Exception as e:
+        log_with_timestamp(f"Failed to download all pages: {e}", Fore.RED)
+        return []
     
-    # Fetch pages in reverse order (last to first) to get oldest songs first
-    for page in range(last_page, 0, -1):
-        api_url = f"{base_api_url}{page}"
-        try:
-            log_with_timestamp(f"Fetching songs (Page {page}/{last_page})...", Fore.MAGENTA)
-            
-            # Update token from container before each request
-            if token_container:
-                current_token = token_container[0]
-                headers = {"Authorization": f"Bearer {current_token}"}
-            
-            response = requests.get(api_url, headers=headers, proxies=pick_proxy_dict(proxies_list), timeout=15)
-            
-            if response.status_code in [401, 403]:
-                log_with_timestamp(f"Authorization failed (status {response.status_code}). Token may be expired.", Fore.RED)
-                
-                # Prompt for new token
-                new_token = prompt_for_new_token()
-                if new_token:
-                    # Update token and retry this page
-                    if token_container:
-                        token_container[0] = new_token
-                    current_token = new_token
-                    headers = {"Authorization": f"Bearer {current_token}"}
-                    
-                    # Retry the current page
-                    log_with_timestamp(f"Retrying page {page} with new token...", Fore.CYAN)
-                    response = requests.get(api_url, headers=headers, proxies=pick_proxy_dict(proxies_list), timeout=15)
-                    if response.status_code in [401, 403]:
-                        log_with_timestamp("New token also invalid. Stopping extraction.", Fore.RED)
-                        return all_songs
-                    response.raise_for_status()
-                    data = response.json()
-                else:
-                    # User cancelled or no token provided
-                    log_with_timestamp(f"Extraction stopped at page {page}. Collected {len(all_songs)} songs so far.", Fore.YELLOW)
-                    return all_songs
-            else:
-                response.raise_for_status()
-                data = response.json()
-                
-        except requests.exceptions.RequestException as e:
-            log_with_timestamp(f"Request failed on page {page}: {e}", Fore.RED)
-            continue
-
-        clips = data if isinstance(data, list) else data.get("clips", [])
-        if not clips:
-            continue
-
-        log_with_timestamp(f"Found {len(clips)} clips on page {page}", Fore.GREEN)
-        
-        # Collect songs from this page
-        page_songs = []
-        for clip in clips:
-            uuid = clip.get("id")
-            title = clip.get("title")
-            audio_url = clip.get("audio_url")
-            image_url = clip.get("image_url")
-            created_at = clip.get("created_at", "")
-            
-            if uuid and title and audio_url:
-                song_data = {
-                    "uuid": uuid,
-                    "title": title,
-                    "audio_url": audio_url,
-                    "image_url": image_url,
-                    "display_name": clip.get("display_name"),
-                    "created_at": created_at
-                }
-                page_songs.append(song_data)
-        
-        # Reverse songs within the page since API returns newest first within each page
-        page_songs.reverse()
-        
-        # Add page songs to queue if provided (for parallel processing)
-        if song_queue is not None:
-            for song in page_songs:
-                song_queue.put(song)
-        
-        all_songs.extend(page_songs)
-        time.sleep(5)
+    # Add songs to queue if provided (for parallel song processing)
+    if song_queue is not None:
+        for song in all_songs:
+            song_queue.put(song)
     
     log_with_timestamp(f"Total songs found: {len(all_songs)}", Fore.GREEN)
     return all_songs
@@ -308,7 +369,7 @@ def get_next_version_filename(base_filename, existing_files):
             return new_filename, counter
         counter += 1
 
-@retry_with_backoff(max_retries=3, initial_delay=2, backoff_factor=2)
+@retry_with_backoff(max_retries=10, initial_delay=2, backoff_factor=2)
 def download_file(url, filename, proxies_list=None, token=None, timeout=30):
     """Download a file with retry logic."""
     headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -359,10 +420,10 @@ def process_song(song_data, args, state, existing_files, proxies_list):
     # Check if already downloaded (return True for was_skipped)
     if uuid in state and os.path.exists(state[uuid]):
         if args.resume:
-            log_with_timestamp(f"⏭️  Skipping: {title} (already downloaded)", Fore.CYAN)
+            log_with_timestamp(f"⏭️  Skipping: {title} [UUID: {uuid}] (already downloaded)", Fore.CYAN)
             return (uuid, state[uuid], True, None, True)  # was_skipped=True
     
-    log_with_timestamp(f"🎵 Processing: {title}", Fore.GREEN)
+    log_with_timestamp(f"🎵 Processing: {title} [UUID: {uuid}]", Fore.GREEN)
     
     fname = sanitize_filename(title) + ".mp3"
     base_path = os.path.join(args.directory, fname)
@@ -374,7 +435,7 @@ def process_song(song_data, args, state, existing_files, proxies_list):
         existing_files.add(final_filename)
     
     try:
-        log_with_timestamp(f"  ⬇️  Downloading: {title}", Fore.WHITE)
+        log_with_timestamp(f"  ⬇️  Downloading: {title} [UUID: {uuid}]", Fore.WHITE)
         saved_path = download_file(
             song_data["audio_url"], 
             final_path, 
@@ -384,7 +445,7 @@ def process_song(song_data, args, state, existing_files, proxies_list):
         )
         
         if args.with_thumbnail and song_data.get("image_url"):
-            log_with_timestamp(f"  🖼️  Embedding thumbnail: {title}", Fore.WHITE)
+            log_with_timestamp(f"  🖼️  Embedding thumbnail: {title} [UUID: {uuid}]", Fore.WHITE)
             embed_metadata(
                 saved_path, 
                 image_url=song_data["image_url"], 
@@ -400,15 +461,15 @@ def process_song(song_data, args, state, existing_files, proxies_list):
         
         # Show version info
         if version > 1:
-            log_with_timestamp(f"  ✅ Saved as v{version}: {os.path.basename(saved_path)}", Fore.YELLOW)
+            log_with_timestamp(f"  ✅ Saved as v{version}: {os.path.basename(saved_path)} [UUID: {uuid}]", Fore.YELLOW)
         else:
-            log_with_timestamp(f"  ✅ Saved: {os.path.basename(saved_path)}", Fore.GREEN)
+            log_with_timestamp(f"  ✅ Saved: {os.path.basename(saved_path)} [UUID: {uuid}]", Fore.GREEN)
         
         return (uuid, saved_path, True, None, False)  # was_skipped=False
         
     except Exception as e:
         error_msg = str(e)
-        log_with_timestamp(f"  ❌ Failed: {title} - {error_msg}", Fore.RED)
+        log_with_timestamp(f"  ❌ Failed: {title} [UUID: {uuid}] - {error_msg}", Fore.RED)
         
         # Create placeholder file
         placeholder = create_placeholder_file(final_path, error_msg)
