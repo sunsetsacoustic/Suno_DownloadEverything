@@ -278,19 +278,37 @@ def create_placeholder_file(filename, error_message):
         print(f"{Fore.RED}Could not create placeholder file: {e}")
         return None
 
+def set_file_timestamp(filepath, created_at_str):
+    """Set file modification time based on Suno's created_at timestamp."""
+    if not created_at_str:
+        return
+    
+    try:
+        # Parse ISO 8601 timestamp from Suno API
+        from datetime import datetime
+        # Handle formats like "2024-01-15T12:34:56.789Z"
+        dt = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+        timestamp = dt.timestamp()
+        
+        # Set both access and modification time
+        os.utime(filepath, (timestamp, timestamp))
+    except Exception as e:
+        # Silently fail if timestamp parsing fails
+        pass
+
 def process_song(song_data, args, state, existing_files, proxies_list):
     """
     Process a single song download with retry logic and state management.
-    Returns (uuid, filename, success, error_message)
+    Returns (uuid, filename, success, error_message, was_skipped)
     """
     uuid = song_data["uuid"]
     title = song_data["title"] or uuid
     
-    # Check if already downloaded
+    # Check if already downloaded (return True for was_skipped)
     if uuid in state and os.path.exists(state[uuid]):
         if args.resume:
             log_with_timestamp(f"⏭️  Skipping: {title} (already downloaded)", Fore.CYAN)
-            return (uuid, state[uuid], True, None)
+            return (uuid, state[uuid], True, None, True)  # was_skipped=True
     
     log_with_timestamp(f"🎵 Processing: {title}", Fore.GREEN)
     
@@ -324,13 +342,17 @@ def process_song(song_data, args, state, existing_files, proxies_list):
                 proxies_list=proxies_list
             )
         
+        # Set file timestamp to match Suno's created_at
+        if song_data.get("created_at"):
+            set_file_timestamp(saved_path, song_data["created_at"])
+        
         # Show version info
         if version > 1:
             log_with_timestamp(f"  ✅ Saved as v{version}: {os.path.basename(saved_path)}", Fore.YELLOW)
         else:
             log_with_timestamp(f"  ✅ Saved: {os.path.basename(saved_path)}", Fore.GREEN)
         
-        return (uuid, saved_path, True, None)
+        return (uuid, saved_path, True, None, False)  # was_skipped=False
         
     except Exception as e:
         error_msg = str(e)
@@ -341,7 +363,7 @@ def process_song(song_data, args, state, existing_files, proxies_list):
         if placeholder:
             log_with_timestamp(f"  📝 Created placeholder: {os.path.basename(placeholder)}", Fore.YELLOW)
         
-        return (uuid, None, False, error_msg)
+        return (uuid, None, False, error_msg, False)  # was_skipped=False
 
 def main():
     parser = argparse.ArgumentParser(description="Bulk download your private suno songs")
@@ -419,10 +441,10 @@ def main():
                     done_futures = [f for f in futures if f.done()]
                     for future in done_futures:
                         try:
-                            uuid, filename, success, error = future.result()
+                            uuid, filename, success, error, was_skipped = future.result()
                             if success and filename:
                                 state[uuid] = filename
-                                if uuid in state and args.resume and os.path.exists(state[uuid]):
+                                if was_skipped:
                                     skipped_count += 1
                                 else:
                                     downloaded_count += 1
@@ -460,10 +482,10 @@ def main():
             # Wait for remaining futures
             for future in futures:
                 try:
-                    uuid, filename, success, error = future.result()
+                    uuid, filename, success, error, was_skipped = future.result()
                     if success and filename:
                         state[uuid] = filename
-                        if uuid in state and args.resume and os.path.exists(state[uuid]):
+                        if was_skipped:
                             skipped_count += 1
                         else:
                             downloaded_count += 1
@@ -490,11 +512,11 @@ def main():
         skipped_count = 0
         
         for i, song_data in enumerate(songs, 1):
-            uuid, filename, success, error = process_song(song_data, args, state, existing_files, proxies_list)
+            uuid, filename, success, error, was_skipped = process_song(song_data, args, state, existing_files, proxies_list)
             
             if success and filename:
                 state[uuid] = filename
-                if uuid in state and args.resume and os.path.exists(state[uuid]):
+                if was_skipped:
                     skipped_count += 1
                 else:
                     downloaded_count += 1

@@ -169,13 +169,14 @@ def test_process_song_with_resume():
         }
         
         # Should skip the download
-        uuid, filename, success, error = sd.process_song(
+        uuid, filename, success, error, was_skipped = sd.process_song(
             song_data, args, state, existing_files, None
         )
         
         assert success is True
         assert filename == existing_file
         assert error is None
+        assert was_skipped is True
     
     print("✓ process_song with resume tests passed")
 
