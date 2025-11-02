@@ -92,10 +92,10 @@ def test_retry_decorator():
     """Test retry with backoff decorator."""
     print("Testing retry decorator...")
     
-    # Create a function that fails twice then succeeds
+    # Test default retry count is now 10
     call_count = [0]
     
-    @sd.retry_with_backoff(max_retries=3, initial_delay=0.1, backoff_factor=2)
+    @sd.retry_with_backoff(initial_delay=0.1, backoff_factor=2)
     def failing_function():
         call_count[0] += 1
         if call_count[0] < 3:
@@ -106,7 +106,7 @@ def test_retry_decorator():
     assert result == "success"
     assert call_count[0] == 3
     
-    # Test function that always fails
+    # Test function that always fails with explicit retry count
     @sd.retry_with_backoff(max_retries=2, initial_delay=0.1, backoff_factor=2)
     def always_fails():
         raise Exception("Always fails")

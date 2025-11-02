@@ -526,26 +526,33 @@ def main():
         extraction_incomplete = [False]  # Track if extraction stopped early
         
         def extract_songs():
-            songs = extract_private_song_info(token_container[0], proxies_list, song_queue, token_container)
-            total_songs[0] = len(songs)
-            extraction_complete.set()
-            
-            # Check if we got all songs or stopped early
             try:
-                last_page = find_last_page(token_container[0], proxies_list)
-                expected_songs_approx = last_page * 20  # Rough estimate
-                if len(songs) < expected_songs_approx * 0.9:  # If we got less than 90% of expected
-                    extraction_incomplete[0] = True
-            except:
-                pass
-            
-            if extraction_incomplete[0]:
-                log_with_timestamp(f"Extraction incomplete: {len(songs)} songs found (may be partial due to token expiration)", Fore.YELLOW)
-            else:
-                log_with_timestamp(f"Extraction complete: {len(songs)} total songs found", Fore.GREEN)
+                songs = extract_private_song_info(token_container[0], proxies_list, song_queue, token_container)
+                total_songs[0] = len(songs)
+                extraction_incomplete[0] = False
+                log_with_timestamp(f"✅ All pages extracted: {len(songs)} total songs found", Fore.GREEN)
+            except Exception as e:
+                log_with_timestamp(f"❌ Page extraction failed: {e}", Fore.RED)
+                extraction_incomplete[0] = True
+            finally:
+                extraction_complete.set()
         
         extraction_thread = threading.Thread(target=extract_songs)
         extraction_thread.start()
+        
+        # Wait for extraction to complete before starting downloads
+        extraction_thread.join()
+        
+        # Check if extraction failed
+        if extraction_incomplete[0]:
+            log_with_timestamp("❌ Page extraction failed. Cannot proceed with downloads.", Fore.RED)
+            sys.exit(1)
+        
+        if total_songs[0] == 0:
+            log_with_timestamp("No songs found. Please check your token.", Fore.RED)
+            sys.exit(1)
+        
+        log_with_timestamp(f"🚀 Starting parallel song downloads ({args.max_workers} workers)...", Fore.CYAN)
         
         # Process songs as they come in
         downloaded_count = 0
@@ -556,7 +563,8 @@ def main():
         with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
             futures = []
             
-            while not extraction_complete.is_set() or not song_queue.empty():
+            # Now process all songs from the queue (all pages were already downloaded)
+            while not song_queue.empty():
                 # Submit new tasks as songs become available
                 while len(futures) < args.max_workers and not song_queue.empty():
                     try:
@@ -588,23 +596,16 @@ def main():
                             failed_count += 1
                         futures.remove(future)
                 
-                # Progress update every 30 seconds (only if we've started processing)
+                # Progress update every 30 seconds
                 if time.time() - last_progress_time > 30:
                     total = downloaded_count + failed_count + skipped_count
-                    # Only show progress if we've actually processed something or extraction is complete
-                    if total > 0 or extraction_complete.is_set():
-                        if total_songs[0] > 0:
-                            progress = (total / total_songs[0]) * 100
-                            log_with_timestamp(
-                                f"📊 Progress: {total}/{total_songs[0]} ({progress:.1f}%) | "
-                                f"✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
-                                Fore.CYAN
-                            )
-                        else:
-                            log_with_timestamp(
-                                f"📊 Processed: {total} | ✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
-                                Fore.CYAN
-                            )
+                    if total > 0:
+                        progress = (total / total_songs[0]) * 100
+                        log_with_timestamp(
+                            f"📊 Progress: {total}/{total_songs[0]} ({progress:.1f}%) | "
+                            f"✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
+                            Fore.CYAN
+                        )
                     last_progress_time = time.time()
                 
                 time.sleep(0.1)
@@ -624,8 +625,6 @@ def main():
                 except Exception as e:
                     log_with_timestamp(f"Unexpected error: {e}", Fore.RED)
                     failed_count += 1
-        
-        extraction_thread.join()
         
     else:
         # Sequential processing (original behavior but improved)
@@ -671,27 +670,15 @@ def main():
     end_time = datetime.now()
     duration = end_time - start_time
     
-    # Check if extraction was incomplete
-    was_incomplete = args.max_workers > 1 and 'extraction_incomplete' in locals() and extraction_incomplete[0]
-    
     log_with_timestamp("=" * 60, Fore.CYAN)
-    if was_incomplete:
-        log_with_timestamp("⚠️  DOWNLOAD INCOMPLETE (TOKEN EXPIRED) ⚠️", Fore.YELLOW)
-    else:
-        log_with_timestamp("🎵 DOWNLOAD COMPLETE 🎵", Fore.GREEN)
+    log_with_timestamp("🎵 DOWNLOAD COMPLETE 🎵", Fore.GREEN)
     log_with_timestamp("=" * 60, Fore.CYAN)
     log_with_timestamp(f"✅ Successfully downloaded: {downloaded_count}", Fore.GREEN)
-    if args.max_workers > 1 and 'skipped_count' in locals():
-        log_with_timestamp(f"⏭️  Skipped (already downloaded): {skipped_count}", Fore.CYAN)
+    log_with_timestamp(f"⏭️  Skipped (already downloaded): {skipped_count}", Fore.CYAN)
     if failed_count > 0:
         log_with_timestamp(f"❌ Failed: {failed_count}", Fore.RED)
     log_with_timestamp(f"⏱️  Total time: {duration}", Fore.CYAN)
     log_with_timestamp(f"📁 Files are in '{args.directory}'", Fore.CYAN)
-    
-    if was_incomplete:
-        log_with_timestamp("", Fore.WHITE)
-        log_with_timestamp("⚠️  Note: Extraction stopped early due to token expiration.", Fore.YELLOW)
-        log_with_timestamp("Run the script again with --resume to continue downloading remaining songs.", Fore.YELLOW)
     
     log_with_timestamp("=" * 60, Fore.CYAN)
     
