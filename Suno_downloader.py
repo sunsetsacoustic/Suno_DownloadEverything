@@ -4,10 +4,11 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
-from queue import Queue
+from queue import Queue, Empty
 from threading import Lock
 
 import requests
@@ -154,8 +155,9 @@ def extract_private_song_info(token_string, proxies_list=None, song_queue=None):
                 page_songs.append(song_data)
         
         # Add page songs to queue if provided (for parallel processing)
+        # Note: API returns newest first, so we reverse each page and the final list
+        # to achieve oldest-first chronological order
         if song_queue is not None:
-            # Reverse page songs so they're in chronological order within the page
             for song in reversed(page_songs):
                 song_queue.put(song)
         
@@ -164,6 +166,7 @@ def extract_private_song_info(token_string, proxies_list=None, song_queue=None):
         time.sleep(5)
     
     # Return songs in chronological order (oldest first)
+    # The API returns newest first, so we reverse the entire list
     all_songs.reverse()
     return all_songs
 
@@ -302,7 +305,6 @@ def main():
         song_queue = Queue()
         
         # Start extraction in background and feed queue
-        import threading
         extraction_complete = threading.Event()
         
         def extract_songs():
@@ -327,7 +329,7 @@ def main():
                         song_data = song_queue.get_nowait()
                         future = executor.submit(process_song, song_data, args, state, existing_files, proxies_list)
                         futures.append(future)
-                    except:
+                    except Empty:
                         break
                 
                 # Check completed tasks
