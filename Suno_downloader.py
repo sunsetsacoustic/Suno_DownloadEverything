@@ -32,6 +32,24 @@ def log_with_timestamp(message, color=Fore.WHITE):
     with print_lock:
         print(f"{Fore.CYAN}[{timestamp}]{Style.RESET_ALL} {color}{message}{Style.RESET_ALL}")
 
+def prompt_for_new_token():
+    """Prompt user for a new token when the current one expires."""
+    log_with_timestamp("=" * 60, Fore.YELLOW)
+    log_with_timestamp("⚠️  TOKEN EXPIRED - PLEASE PROVIDE NEW TOKEN", Fore.YELLOW)
+    log_with_timestamp("=" * 60, Fore.YELLOW)
+    print()
+    try:
+        new_token = input(f"{Fore.CYAN}Enter new Bearer token (or press Ctrl+C to abort): {Style.RESET_ALL}").strip()
+        if new_token:
+            log_with_timestamp("✅ New token received, resuming...", Fore.GREEN)
+            return new_token
+        else:
+            log_with_timestamp("❌ No token provided", Fore.RED)
+            return None
+    except (KeyboardInterrupt, EOFError):
+        log_with_timestamp("❌ Aborted by user", Fore.RED)
+        return None
+
 def sanitize_filename(name, maxlen=200):
     safe = re.sub(FILENAME_BAD_CHARS, "_", name)
     safe = safe.strip(" .")
@@ -169,17 +187,21 @@ def find_last_page(token_string, proxies_list=None):
     log_with_timestamp(f"✅ Found last page: {low}", Fore.GREEN)
     return low
 
-def extract_private_song_info(token_string, proxies_list=None, song_queue=None):
+def extract_private_song_info(token_string, proxies_list=None, song_queue=None, token_container=None):
     """
     Extract private song info and optionally add songs to a queue for immediate processing.
     Returns songs in chronological order (oldest first) by fetching pages in reverse.
+    token_container: optional list containing [token] that can be updated when token expires
     """
     log_with_timestamp("Extracting private songs using Authorization Token...", Fore.CYAN)
     base_api_url = "https://studio-api.prod.suno.com/api/feed/v2?hide_disliked=true&hide_gen_stems=true&hide_studio_clips=true&page="
-    headers = {"Authorization": f"Bearer {token_string}"}
+    
+    # Use token from container if provided, otherwise use token_string
+    current_token = token_container[0] if token_container else token_string
+    headers = {"Authorization": f"Bearer {current_token}"}
 
     # Find the last page first
-    last_page = find_last_page(token_string, proxies_list)
+    last_page = find_last_page(current_token, proxies_list)
     if last_page == 0:
         return []
     
@@ -190,12 +212,42 @@ def extract_private_song_info(token_string, proxies_list=None, song_queue=None):
         api_url = f"{base_api_url}{page}"
         try:
             log_with_timestamp(f"Fetching songs (Page {page}/{last_page})...", Fore.MAGENTA)
+            
+            # Update token from container before each request
+            if token_container:
+                current_token = token_container[0]
+                headers = {"Authorization": f"Bearer {current_token}"}
+            
             response = requests.get(api_url, headers=headers, proxies=pick_proxy_dict(proxies_list), timeout=15)
+            
             if response.status_code in [401, 403]:
                 log_with_timestamp(f"Authorization failed (status {response.status_code}). Token may be expired.", Fore.RED)
-                return all_songs
-            response.raise_for_status()
-            data = response.json()
+                
+                # Prompt for new token
+                new_token = prompt_for_new_token()
+                if new_token:
+                    # Update token and retry this page
+                    if token_container:
+                        token_container[0] = new_token
+                    current_token = new_token
+                    headers = {"Authorization": f"Bearer {current_token}"}
+                    
+                    # Retry the current page
+                    log_with_timestamp(f"Retrying page {page} with new token...", Fore.CYAN)
+                    response = requests.get(api_url, headers=headers, proxies=pick_proxy_dict(proxies_list), timeout=15)
+                    if response.status_code in [401, 403]:
+                        log_with_timestamp("New token also invalid. Stopping extraction.", Fore.RED)
+                        return all_songs
+                    response.raise_for_status()
+                    data = response.json()
+                else:
+                    # User cancelled or no token provided
+                    log_with_timestamp(f"Extraction stopped at page {page}. Collected {len(all_songs)} songs so far.", Fore.YELLOW)
+                    return all_songs
+            else:
+                response.raise_for_status()
+                data = response.json()
+                
         except requests.exceptions.RequestException as e:
             log_with_timestamp(f"Request failed on page {page}: {e}", Fore.RED)
             continue
@@ -399,6 +451,9 @@ def main():
     
     proxies_list = args.proxy.split(",") if args.proxy else None
     
+    # Token container that can be updated when token expires
+    token_container = [args.token]
+    
     # Use parallel processing if max_workers > 1, otherwise use queue-based approach
     if args.max_workers > 1:
         log_with_timestamp(f"Using parallel downloads with {args.max_workers} workers", Fore.CYAN)
@@ -407,12 +462,26 @@ def main():
         # Start extraction in background and feed queue
         extraction_complete = threading.Event()
         total_songs = [0]  # Use list to allow modification in nested function
+        extraction_incomplete = [False]  # Track if extraction stopped early
         
         def extract_songs():
-            songs = extract_private_song_info(args.token, proxies_list, song_queue)
+            songs = extract_private_song_info(token_container[0], proxies_list, song_queue, token_container)
             total_songs[0] = len(songs)
             extraction_complete.set()
-            log_with_timestamp(f"Extraction complete: {len(songs)} total songs found", Fore.GREEN)
+            
+            # Check if we got all songs or stopped early
+            try:
+                last_page = find_last_page(token_container[0], proxies_list)
+                expected_songs_approx = last_page * 20  # Rough estimate
+                if len(songs) < expected_songs_approx * 0.9:  # If we got less than 90% of expected
+                    extraction_incomplete[0] = True
+            except:
+                pass
+            
+            if extraction_incomplete[0]:
+                log_with_timestamp(f"Extraction incomplete: {len(songs)} songs found (may be partial due to token expiration)", Fore.YELLOW)
+            else:
+                log_with_timestamp(f"Extraction complete: {len(songs)} total songs found", Fore.GREEN)
         
         extraction_thread = threading.Thread(target=extract_songs)
         extraction_thread.start()
@@ -499,7 +568,7 @@ def main():
         
     else:
         # Sequential processing (original behavior but improved)
-        songs = extract_private_song_info(args.token, proxies_list)
+        songs = extract_private_song_info(token_container[0], proxies_list, None, token_container)
         
         if not songs:
             log_with_timestamp("No songs found. Please check your token.", Fore.RED)
@@ -541,8 +610,14 @@ def main():
     end_time = datetime.now()
     duration = end_time - start_time
     
+    # Check if extraction was incomplete
+    was_incomplete = args.max_workers > 1 and 'extraction_incomplete' in locals() and extraction_incomplete[0]
+    
     log_with_timestamp("=" * 60, Fore.CYAN)
-    log_with_timestamp("🎵 DOWNLOAD COMPLETE 🎵", Fore.GREEN)
+    if was_incomplete:
+        log_with_timestamp("⚠️  DOWNLOAD INCOMPLETE (TOKEN EXPIRED) ⚠️", Fore.YELLOW)
+    else:
+        log_with_timestamp("🎵 DOWNLOAD COMPLETE 🎵", Fore.GREEN)
     log_with_timestamp("=" * 60, Fore.CYAN)
     log_with_timestamp(f"✅ Successfully downloaded: {downloaded_count}", Fore.GREEN)
     if args.max_workers > 1 and 'skipped_count' in locals():
@@ -551,6 +626,12 @@ def main():
         log_with_timestamp(f"❌ Failed: {failed_count}", Fore.RED)
     log_with_timestamp(f"⏱️  Total time: {duration}", Fore.CYAN)
     log_with_timestamp(f"📁 Files are in '{args.directory}'", Fore.CYAN)
+    
+    if was_incomplete:
+        log_with_timestamp("", Fore.WHITE)
+        log_with_timestamp("⚠️  Note: Extraction stopped early due to token expiration.", Fore.YELLOW)
+        log_with_timestamp("Run the script again with --resume to continue downloading remaining songs.", Fore.YELLOW)
+    
     log_with_timestamp("=" * 60, Fore.CYAN)
     
     sys.exit(0)
