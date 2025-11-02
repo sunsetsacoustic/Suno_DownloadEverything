@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 import json
 import os
 import random
@@ -12,7 +13,7 @@ from queue import Queue, Empty
 from threading import Lock
 
 import requests
-from colorama import Fore, init
+from colorama import Fore, Style, init
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, error
 from mutagen.mp3 import MP3
 
@@ -21,8 +22,15 @@ init(autoreset=True)
 FILENAME_BAD_CHARS = r'[<>:"/\\|?*\x00-\x1F]'
 STATE_FILE = "suno_download_state.json"
 
-# Global lock for thread-safe file operations
+# Global lock for thread-safe file operations and printing
 state_lock = Lock()
+print_lock = Lock()
+
+def log_with_timestamp(message, color=Fore.WHITE):
+    """Thread-safe logging with timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with print_lock:
+        print(f"{Fore.CYAN}[{timestamp}]{Style.RESET_ALL} {color}{message}{Style.RESET_ALL}")
 
 def sanitize_filename(name, maxlen=200):
     safe = re.sub(FILENAME_BAD_CHARS, "_", name)
@@ -101,38 +109,76 @@ def embed_metadata(mp3_path, image_url=None, title=None, artist=None, proxies_li
     audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=image_bytes))
     audio.save(v2_version=3)
 
-def extract_private_song_info(token_string, proxies_list=None, song_queue=None):
-    """
-    Extract private song info and optionally add songs to a queue for immediate processing.
-    Returns songs in chronological order (oldest first).
-    """
-    print(f"{Fore.CYAN}Extracting private songs using Authorization Token...")
+def find_last_page(token_string, proxies_list=None):
+    """Find the last page number (which contains the oldest songs)."""
+    log_with_timestamp("Finding total number of pages...", Fore.CYAN)
     base_api_url = "https://studio-api.prod.suno.com/api/feed/v2?hide_disliked=true&hide_gen_stems=true&hide_studio_clips=true&page="
     headers = {"Authorization": f"Bearer {token_string}"}
-
-    all_songs = []
+    
     page = 1
+    last_page_with_content = 1
     
     while True:
         api_url = f"{base_api_url}{page}"
         try:
-            print(f"{Fore.MAGENTA}Fetching songs (Page {page})...")
             response = requests.get(api_url, headers=headers, proxies=pick_proxy_dict(proxies_list), timeout=15)
             if response.status_code in [401, 403]:
-                print(f"{Fore.RED}Authorization failed (status {response.status_code}). Your token is likely expired or incorrect.")
-                return []
+                log_with_timestamp(f"Authorization failed (status {response.status_code}). Token may be expired.", Fore.RED)
+                return 0
+            response.raise_for_status()
+            data = response.json()
+            
+            clips = data if isinstance(data, list) else data.get("clips", [])
+            if not clips:
+                break
+            
+            last_page_with_content = page
+            page += 1
+            time.sleep(0.5)  # Quick scan
+            
+        except requests.exceptions.RequestException as e:
+            log_with_timestamp(f"Request failed on page {page}: {e}", Fore.RED)
+            return last_page_with_content
+    
+    log_with_timestamp(f"Found {last_page_with_content} page(s) of songs", Fore.GREEN)
+    return last_page_with_content
+
+def extract_private_song_info(token_string, proxies_list=None, song_queue=None):
+    """
+    Extract private song info and optionally add songs to a queue for immediate processing.
+    Returns songs in chronological order (oldest first) by fetching pages in reverse.
+    """
+    log_with_timestamp("Extracting private songs using Authorization Token...", Fore.CYAN)
+    base_api_url = "https://studio-api.prod.suno.com/api/feed/v2?hide_disliked=true&hide_gen_stems=true&hide_studio_clips=true&page="
+    headers = {"Authorization": f"Bearer {token_string}"}
+
+    # Find the last page first
+    last_page = find_last_page(token_string, proxies_list)
+    if last_page == 0:
+        return []
+    
+    all_songs = []
+    
+    # Fetch pages in reverse order (last to first) to get oldest songs first
+    for page in range(last_page, 0, -1):
+        api_url = f"{base_api_url}{page}"
+        try:
+            log_with_timestamp(f"Fetching songs (Page {page}/{last_page})...", Fore.MAGENTA)
+            response = requests.get(api_url, headers=headers, proxies=pick_proxy_dict(proxies_list), timeout=15)
+            if response.status_code in [401, 403]:
+                log_with_timestamp(f"Authorization failed (status {response.status_code}). Token may be expired.", Fore.RED)
+                return all_songs
             response.raise_for_status()
             data = response.json()
         except requests.exceptions.RequestException as e:
-            print(f"{Fore.RED}Request failed on page {page}: {e}")
-            return []
+            log_with_timestamp(f"Request failed on page {page}: {e}", Fore.RED)
+            continue
 
         clips = data if isinstance(data, list) else data.get("clips", [])
         if not clips:
-            print(f"{Fore.YELLOW}No more clips found on page {page}.")
-            break
+            continue
 
-        print(f"{Fore.GREEN}Found {len(clips)} clips on page {page}.")
+        log_with_timestamp(f"Found {len(clips)} clips on page {page}", Fore.GREEN)
         
         # Collect songs from this page
         page_songs = []
@@ -154,20 +200,18 @@ def extract_private_song_info(token_string, proxies_list=None, song_queue=None):
                 }
                 page_songs.append(song_data)
         
+        # Reverse songs within the page since API returns newest first within each page
+        page_songs.reverse()
+        
         # Add page songs to queue if provided (for parallel processing)
-        # Note: API returns newest first, so we reverse each page and the final list
-        # to achieve oldest-first chronological order
         if song_queue is not None:
-            for song in reversed(page_songs):
+            for song in page_songs:
                 song_queue.put(song)
         
         all_songs.extend(page_songs)
-        page += 1
         time.sleep(5)
     
-    # Return songs in chronological order (oldest first)
-    # The API returns newest first, so we reverse the entire list
-    all_songs.reverse()
+    log_with_timestamp(f"Total songs found: {len(all_songs)}", Fore.GREEN)
     return all_songs
 
 def get_next_version_filename(base_filename, existing_files):
@@ -219,10 +263,10 @@ def process_song(song_data, args, state, existing_files, proxies_list):
     # Check if already downloaded
     if uuid in state and os.path.exists(state[uuid]):
         if args.resume:
-            print(f"Skipping: {Fore.CYAN}🎵 {title} (already downloaded as {os.path.basename(state[uuid])})")
+            log_with_timestamp(f"⏭️  Skipping: {title} (already downloaded)", Fore.CYAN)
             return (uuid, state[uuid], True, None)
     
-    print(f"Processing: {Fore.GREEN}🎵 {title}")
+    log_with_timestamp(f"🎵 Processing: {title}", Fore.GREEN)
     
     fname = sanitize_filename(title) + ".mp3"
     base_path = os.path.join(args.directory, fname)
@@ -234,7 +278,7 @@ def process_song(song_data, args, state, existing_files, proxies_list):
         existing_files.add(final_filename)
     
     try:
-        print(f"  -> Downloading...")
+        log_with_timestamp(f"  ⬇️  Downloading: {title}", Fore.WHITE)
         saved_path = download_file(
             song_data["audio_url"], 
             final_path, 
@@ -244,7 +288,7 @@ def process_song(song_data, args, state, existing_files, proxies_list):
         )
         
         if args.with_thumbnail and song_data.get("image_url"):
-            print(f"  -> Embedding thumbnail...")
+            log_with_timestamp(f"  🖼️  Embedding thumbnail: {title}", Fore.WHITE)
             embed_metadata(
                 saved_path, 
                 image_url=song_data["image_url"], 
@@ -254,22 +298,22 @@ def process_song(song_data, args, state, existing_files, proxies_list):
                 proxies_list=proxies_list
             )
         
-        # Show version info if not the first version
+        # Show version info
         if version > 1:
-            print(f"{Fore.YELLOW}  -> Saved as version {version}: {os.path.basename(saved_path)}")
+            log_with_timestamp(f"  ✅ Saved as v{version}: {os.path.basename(saved_path)}", Fore.YELLOW)
         else:
-            print(f"{Fore.GREEN}  -> Saved: {os.path.basename(saved_path)}")
+            log_with_timestamp(f"  ✅ Saved: {os.path.basename(saved_path)}", Fore.GREEN)
         
         return (uuid, saved_path, True, None)
         
     except Exception as e:
         error_msg = str(e)
-        print(f"{Fore.RED}Failed on {title}: {error_msg}")
+        log_with_timestamp(f"  ❌ Failed: {title} - {error_msg}", Fore.RED)
         
         # Create placeholder file
         placeholder = create_placeholder_file(final_path, error_msg)
         if placeholder:
-            print(f"{Fore.YELLOW}  -> Created placeholder: {os.path.basename(placeholder)}")
+            log_with_timestamp(f"  📝 Created placeholder: {os.path.basename(placeholder)}", Fore.YELLOW)
         
         return (uuid, None, False, error_msg)
 
@@ -278,10 +322,18 @@ def main():
     parser.add_argument("--token", type=str, required=True, help="Your Suno session Bearer Token.")
     parser.add_argument("--proxy", type=str, help="Proxy with protocol (comma-separated).")
     parser.add_argument("--directory", type=str, default="suno-downloads", help="Local directory for saving files.")
-    parser.add_argument("--with-thumbnail", action="store_true", help="Embed the song's thumbnail.")
-    parser.add_argument("--max-workers", type=int, default=1, help="Number of parallel downloads (default: 1)")
-    parser.add_argument("--resume", action="store_true", help="Skip already downloaded songs based on state file.")
+    parser.add_argument("--with-thumbnail", action="store_true", default=True, help="Embed the song's thumbnail (default: True)")
+    parser.add_argument("--no-thumbnail", dest="with_thumbnail", action="store_false", help="Disable thumbnail embedding")
+    parser.add_argument("--max-workers", type=int, default=10, help="Number of parallel downloads (default: 10)")
+    parser.add_argument("--resume", action="store_true", default=True, help="Skip already downloaded songs (default: True)")
+    parser.add_argument("--no-resume", dest="resume", action="store_false", help="Disable resume functionality")
     args = parser.parse_args()
+
+    start_time = datetime.now()
+    log_with_timestamp("=" * 60, Fore.CYAN)
+    log_with_timestamp("🎵 SUNO DOWNLOADER STARTED 🎵", Fore.CYAN)
+    log_with_timestamp("=" * 60, Fore.CYAN)
+    log_with_timestamp(f"Settings: Workers={args.max_workers}, Resume={args.resume}, Thumbnails={args.with_thumbnail}", Fore.CYAN)
 
     # Create directory if it doesn't exist
     if not os.path.exists(args.directory):
@@ -289,7 +341,7 @@ def main():
     
     # Load state
     state = load_state(args.directory)
-    print(f"{Fore.CYAN}Loaded state: {len(state)} songs previously downloaded")
+    log_with_timestamp(f"Loaded state: {len(state)} songs previously downloaded", Fore.CYAN)
     
     # Get existing files in directory for version tracking
     existing_files = set()
@@ -301,16 +353,18 @@ def main():
     
     # Use parallel processing if max_workers > 1, otherwise use queue-based approach
     if args.max_workers > 1:
-        print(f"{Fore.CYAN}Using parallel downloads with {args.max_workers} workers")
+        log_with_timestamp(f"Using parallel downloads with {args.max_workers} workers", Fore.CYAN)
         song_queue = Queue()
         
         # Start extraction in background and feed queue
         extraction_complete = threading.Event()
+        total_songs = [0]  # Use list to allow modification in nested function
         
         def extract_songs():
             songs = extract_private_song_info(args.token, proxies_list, song_queue)
+            total_songs[0] = len(songs)
             extraction_complete.set()
-            print(f"{Fore.GREEN}Extraction complete: {len(songs)} total songs found")
+            log_with_timestamp(f"Extraction complete: {len(songs)} total songs found", Fore.GREEN)
         
         extraction_thread = threading.Thread(target=extract_songs)
         extraction_thread.start()
@@ -318,6 +372,8 @@ def main():
         # Process songs as they come in
         downloaded_count = 0
         failed_count = 0
+        skipped_count = 0
+        last_progress_time = time.time()
         
         with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
             futures = []
@@ -340,16 +396,36 @@ def main():
                             uuid, filename, success, error = future.result()
                             if success and filename:
                                 state[uuid] = filename
-                                downloaded_count += 1
+                                if uuid in state and args.resume and os.path.exists(state[uuid]):
+                                    skipped_count += 1
+                                else:
+                                    downloaded_count += 1
                                 # Save state periodically
-                                if downloaded_count % 10 == 0:
+                                if (downloaded_count + skipped_count) % 10 == 0:
                                     save_state(args.directory, state)
                             else:
                                 failed_count += 1
                         except Exception as e:
-                            print(f"{Fore.RED}Unexpected error: {e}")
+                            log_with_timestamp(f"Unexpected error: {e}", Fore.RED)
                             failed_count += 1
                         futures.remove(future)
+                
+                # Progress update every 30 seconds
+                if time.time() - last_progress_time > 30:
+                    total = downloaded_count + failed_count + skipped_count
+                    if total_songs[0] > 0:
+                        progress = (total / total_songs[0]) * 100
+                        log_with_timestamp(
+                            f"📊 Progress: {total}/{total_songs[0]} ({progress:.1f}%) | "
+                            f"✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
+                            Fore.CYAN
+                        )
+                    else:
+                        log_with_timestamp(
+                            f"📊 Processed: {total} | ✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
+                            Fore.CYAN
+                        )
+                    last_progress_time = time.time()
                 
                 time.sleep(0.1)
             
@@ -359,11 +435,14 @@ def main():
                     uuid, filename, success, error = future.result()
                     if success and filename:
                         state[uuid] = filename
-                        downloaded_count += 1
+                        if uuid in state and args.resume and os.path.exists(state[uuid]):
+                            skipped_count += 1
+                        else:
+                            downloaded_count += 1
                     else:
                         failed_count += 1
                 except Exception as e:
-                    print(f"{Fore.RED}Unexpected error: {e}")
+                    log_with_timestamp(f"Unexpected error: {e}", Fore.RED)
                     failed_count += 1
         
         extraction_thread.join()
@@ -373,34 +452,56 @@ def main():
         songs = extract_private_song_info(args.token, proxies_list)
         
         if not songs:
-            print(f"{Fore.RED}No songs found. Please check your token.")
+            log_with_timestamp("No songs found. Please check your token.", Fore.RED)
             sys.exit(1)
         
-        print(f"\n{Fore.CYAN}--- Starting Download Process ({len(songs)} songs to process) ---")
+        log_with_timestamp(f"Starting Download Process ({len(songs)} songs to process)", Fore.CYAN)
         
         downloaded_count = 0
         failed_count = 0
+        skipped_count = 0
         
-        for song_data in songs:
+        for i, song_data in enumerate(songs, 1):
             uuid, filename, success, error = process_song(song_data, args, state, existing_files, proxies_list)
             
             if success and filename:
                 state[uuid] = filename
-                downloaded_count += 1
+                if uuid in state and args.resume and os.path.exists(state[uuid]):
+                    skipped_count += 1
+                else:
+                    downloaded_count += 1
                 # Save state periodically
-                if downloaded_count % 10 == 0:
+                if (downloaded_count + skipped_count) % 10 == 0:
                     save_state(args.directory, state)
+                    
+                # Progress update
+                if i % 10 == 0:
+                    progress = (i / len(songs)) * 100
+                    log_with_timestamp(
+                        f"📊 Progress: {i}/{len(songs)} ({progress:.1f}%) | "
+                        f"✅ {downloaded_count} | ⏭️ {skipped_count} | ❌ {failed_count}",
+                        Fore.CYAN
+                    )
             else:
                 failed_count += 1
     
     # Final state save
     save_state(args.directory, state)
     
-    print(f"\n{Fore.BLUE}Download process complete!")
-    print(f"{Fore.GREEN}Successfully downloaded: {downloaded_count}")
+    end_time = datetime.now()
+    duration = end_time - start_time
+    
+    log_with_timestamp("=" * 60, Fore.CYAN)
+    log_with_timestamp("🎵 DOWNLOAD COMPLETE 🎵", Fore.GREEN)
+    log_with_timestamp("=" * 60, Fore.CYAN)
+    log_with_timestamp(f"✅ Successfully downloaded: {downloaded_count}", Fore.GREEN)
+    if args.max_workers > 1 and 'skipped_count' in locals():
+        log_with_timestamp(f"⏭️  Skipped (already downloaded): {skipped_count}", Fore.CYAN)
     if failed_count > 0:
-        print(f"{Fore.RED}Failed: {failed_count}")
-    print(f"{Fore.CYAN}Files are in '{args.directory}'")
+        log_with_timestamp(f"❌ Failed: {failed_count}", Fore.RED)
+    log_with_timestamp(f"⏱️  Total time: {duration}", Fore.CYAN)
+    log_with_timestamp(f"📁 Files are in '{args.directory}'", Fore.CYAN)
+    log_with_timestamp("=" * 60, Fore.CYAN)
     
     sys.exit(0)
 

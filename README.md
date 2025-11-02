@@ -70,37 +70,37 @@ https://i.imgur.com/PQtOIM5.jpeg
 
 Open your terminal or command prompt, navigate to the script's directory, and run it using the following command structure.
 
-**Basic Usage (downloads audio only):**
+**Basic Usage (recommended defaults):**
 ```bash
 python suno_downloader.py --token "your_token_here"
 ```
-This will download all songs into a new folder named `suno-downloads`.
+This will download all songs with thumbnails using 10 parallel workers and resume support enabled by default.
 
-**Full-Featured Usage (with thumbnails and a custom directory):**
+**Custom Configuration:**
 ```bash
-python suno_downloader.py --token "your_token_here" --directory "My Suno Music" --with-thumbnail
+python suno_downloader.py --token "your_token_here" --directory "My Suno Music" --max-workers 20
 ```
-This will download all songs and their thumbnails into a folder named `My Suno Music`.
+This will use 20 parallel workers and save to a custom directory.
 
-**Parallel Downloads (faster for large libraries):**
+**Disable Resume (redownload everything):**
 ```bash
-python suno_downloader.py --token "your_token_here" --max-workers 5 --with-thumbnail
+python suno_downloader.py --token "your_token_here" --no-resume
 ```
-This will download 5 songs simultaneously, significantly speeding up the process.
+This will reprocess all songs, even those already downloaded.
 
-**Resume Downloads (skip already downloaded songs):**
+**Sequential Downloads (no parallel):**
 ```bash
-python suno_downloader.py --token "your_token_here" --resume
+python suno_downloader.py --token "your_token_here" --max-workers 1
 ```
-This will skip songs that have already been downloaded, allowing you to run the script multiple times to only fetch new songs.
+This will download songs one at a time (useful for limited bandwidth).
 
 ### Command-Line Arguments
 
 - `--token` **(Required)**: Your Suno authorization token.
 - `--directory` (Optional): The local directory where files will be saved. Defaults to `suno-downloads`.
-- `--with-thumbnail` (Optional): A flag to download and embed the song's cover art.
-- `--max-workers` (Optional): Number of parallel downloads (default: 1). Higher values download faster but use more bandwidth.
-- `--resume` (Optional): Skip songs that have already been downloaded based on the state file.
+- `--with-thumbnail` (Optional): Embed the song's cover art (default: **enabled**). Use `--no-thumbnail` to disable.
+- `--max-workers` (Optional): Number of parallel downloads (default: **10**). Higher values download faster but use more bandwidth.
+- `--resume` (Optional): Skip already downloaded songs (default: **enabled**). Use `--no-resume` to disable.
 - `--proxy` (Optional): A proxy server URL (e.g., `http://user:pass@127.0.0.1:8080`). You can provide multiple proxies separated by commas.
 
 ### New Features Explained
@@ -109,13 +109,20 @@ This will skip songs that have already been downloaded, allowing you to run the 
 If a download fails due to network issues (like timeouts), the script will automatically retry up to 3 times with increasing delays between attempts. This ensures that temporary network issues don't cause missing files.
 
 #### Chronological Order
-Songs are now downloaded from oldest to newest. This means your first song will be named without a version number, and newer songs with the same name will get version numbers (v2, v3, etc.). This is more intuitive than the previous behavior.
+Songs are now downloaded from **oldest to newest**. The script first finds the last page of your library (which contains your oldest songs), then works backwards through the pages. Within each page, songs are also ordered chronologically. This means your first song will be named without a version number, and newer songs with the same name will get version numbers (v2, v3, etc.). This is more intuitive and prevents versioning issues.
 
 #### Parallel Downloads
-Use `--max-workers` to download multiple songs at the same time. For example, `--max-workers 5` will download 5 songs simultaneously. This is especially useful for large libraries (like 9000+ songs).
+By default, the script uses **10 parallel workers** to download songs simultaneously. This dramatically speeds up the process for large libraries (like 9000+ songs). You can adjust this with `--max-workers N`. All parallel operations are thread-safe with proper locking to prevent race conditions. The output is formatted with timestamps and progress indicators to track activity clearly.
 
 #### Resume Support
-The script now maintains a state file (`suno_download_state.json`) that tracks which songs have been successfully downloaded. Use `--resume` to skip already downloaded songs and only fetch new ones. This is perfect for regularly updating your library without re-downloading everything.
+The script maintains a state file (`suno_download_state.json`) that tracks which songs have been successfully downloaded. **Resume is enabled by default**, so running the script multiple times will only download new songs. This is perfect for regularly updating your library without re-downloading everything. Use `--no-resume` to force reprocessing all songs.
+
+#### Progress Tracking
+The script now includes:
+- **Timestamps** on all log messages so you can see exactly when each action occurred
+- **Progress updates** every 30 seconds showing how many songs processed, downloaded, skipped, and failed
+- **Formatted output** that's easy to read even with parallel downloads
+- **Duration tracking** showing total time elapsed when complete
 
 #### Failure Placeholders
 If a download fails after all retry attempts, the script creates a placeholder text file (e.g., `Song Name_FAILED.txt`) that contains the error message. This ensures you can identify which downloads failed and why.
